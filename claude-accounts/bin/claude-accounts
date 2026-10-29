@@ -1,0 +1,187 @@
+#!/bin/bash
+# Claude account switcher, built the way Orca's is: one config folder per account. Chats, skills,
+# hooks and settings are links into ~/.claude, so switching moves no session; only the login and
+# the account's own state stay per account. ~/.claude itself is the "System default" account.
+#
+#   claude-accounts                    list accounts (same as ls)
+#   claude-accounts ls [--json]        accounts, their logins, and which one is active
+#   claude-accounts use <id|default>   new Claude sessions use that account
+#   claude-accounts dir                config folder of the active account (empty for default)
+#   claude-accounts add                new account folder, signed out; prints its id
+#   claude-accounts login <id>         sign that account in (interactive)
+#   claude-accounts provision <id>     redo the links into ~/.claude
+#   claude-accounts remove <id>        forget it and move its folder to backups
+set -euo pipefail
+
+STATE="$HOME/.claude-accounts"
+MAIN="$HOME/.claude"
+REG="$STATE/accounts.json"
+CLAUDE_BIN="$HOME/.local/bin/claude"
+[ -x "$CLAUDE_BIN" ] || CLAUDE_BIN=$(command -v claude)
+
+HISTORY=(projects session-env file-history shell-snapshots todos paste-cache tasks plans transcripts history.jsonl)
+
+mkdir -p "$STATE"
+[ -f "$REG" ] || printf '{"accounts":[]}\n' >"$REG"
+
+die() { echo "claude-accounts: $*" >&2; exit 1; }
+
+account_dir() { jq -r --arg id "$1" '.accounts[] | select(.id == $id) | .dir' "$REG"; }
+
+active_id() { cat "$STATE/active" 2>/dev/null || echo default; }
+
+write_reg() {
+    local tmp="$REG.tmp.$$"
+    jq "$@" "$REG" >"$tmp" && mv "$tmp" "$REG"
+}
+
+# Login, per-account runtime, and org-managed policy never leave their account.
+is_private() {
+    case "$1" in
+        .* | backups | cache | chrome | uploads | usage-data | api-dumps | bridge-spawn | ccr | \
+            ccr-home-seed.json | active-time.json | antproto.json | daemon* | agent-memory* | \
+            sessions | statsig | telemetry | debug | ide | stats-cache.json | policy-limits* | \
+            remote-settings* | *.bak | *.bak-* | *backup*) return 0 ;;
+    esac
+    local h
+    for h in "${HISTORY[@]}"; do [ "$1" = "$h" ] && return 0; done
+    return 1
+}
+
+# Point dir/name at ~/.claude/name. A real file or folder there is kept in backups, never deleted.
+link_into() {
+    local dir="$1" name="$2" backup="$3" target="$MAIN/$2" here="$1/$2"
+    [ -L "$here" ] && [ "$(readlink "$here")" = "$target" ] && return 0
+    if [ -L "$here" ]; then
+        rm "$here"
+    elif [ -e "$here" ]; then
+        # History merges into the shared copy first; an existing entry there wins.
+        if [ -d "$here" ] && [ -d "$target" ]; then
+            rsync -a --ignore-existing "$here/" "$target/"
+        fi
+        mkdir -p "$backup"
+        mv "$here" "$backup/"
+    fi
+    ln -s "$target" "$here"
+}
+
+# Account-bound keys stay; everything else (MCP servers, project trust, onboarding) comes from main.
+merge_claude_json() {
+    local dir="$1" mine="$1/.claude.json" tmp
+    [ -f "$HOME/.claude.json" ] || return 0
+    [ -f "$mine" ] || printf '{}\n' >"$mine"
+    tmp="$mine.tmp.$$"
+    jq -s '
+        def bound: test("^(oauthAccount|userID|machineID|firstStartTime|firstStartVersion|primaryApiKey|claudeCodeFirstTokenDate|subscriptionNoticeCount|hasAvailableSubscription|startupPrefetchedAt|lastSeenOrgDefaultUpdatedAt|artifactRosterDenied|additionalModel.*)$")
+            or test("Cache") or test("^cached") or test("^passes");
+        .[1] * (.[0] | with_entries(select(.key | bound | not)))
+    ' "$HOME/.claude.json" "$mine" >"$tmp" && mv "$tmp" "$mine"
+    chmod 600 "$mine"
+}
+
+provision() {
+    local id="$1" dir name backup
+    dir=$(account_dir "$id")
+    [ -n "$dir" ] || die "no account $id"
+    mkdir -p "$dir"
+    backup="$STATE/backups/$id-$(date +%Y%m%d-%H%M%S)"
+    for name in "${HISTORY[@]}"; do
+        [ -e "$MAIN/$name" ] || mkdir -p "$MAIN/$name"
+        link_into "$dir" "$name" "$backup"
+    done
+    for path in "$MAIN"/*; do
+        name=${path##*/}
+        is_private "$name" || link_into "$dir" "$name" "$backup"
+    done
+    merge_claude_json "$dir"
+    [ -d "$backup" ] && echo "kept the old copies in $backup" >&2
+    return 0
+}
+
+# A signed-out account still prints its JSON but exits non-zero, so keep the output, not the status.
+status_json() {
+    local out
+    if [ "$1" = default ]; then
+        out=$(env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" auth status --json 2>/dev/null) || true
+    else
+        out=$(CLAUDE_CONFIG_DIR="$1" "$CLAUDE_BIN" auth status --json 2>/dev/null) || true
+    fi
+    if printf '%s' "$out" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        printf '%s\n' "$out"
+    else
+        echo '{"loggedIn":false}'
+    fi
+}
+
+cmd_ls() {
+    local active rows="" id dir added
+    active=$(active_id)
+    while IFS=$'\t' read -r id dir added; do
+        [ -n "$id" ] || continue
+        rows+=$(status_json "$dir" | jq -c --arg id "$id" --arg dir "$dir" --arg added "$added" \
+            '{id: $id, dir: $dir, addedAt: $added, loggedIn: (.loggedIn // false), email, orgName, subscriptionType}')$'\n'
+    done < <(jq -r '.accounts[] | "\(.id)\t\(.dir)\t\(.addedAt // "")"' "$REG")
+    local json
+    json=$(jq -n --arg active "$active" --argjson def "$(status_json default)" --argjson accounts "$(printf '%s' "$rows" | jq -s .)" '
+        {active: $active,
+         systemDefault: {loggedIn: ($def.loggedIn // false), email: $def.email, orgName: $def.orgName, subscriptionType: $def.subscriptionType},
+         accounts: $accounts}')
+    if [ "${1:-}" = "--json" ]; then
+        printf '%s\n' "$json"
+        return
+    fi
+    printf '%s\n' "$json" | jq -r '
+        (if .active == "default" then "* " else "  " end) + "default   " + (.systemDefault.email // "signed out") + "  (System default)",
+        (.active as $a | .accounts[] | (if .id == $a then "* " else "  " end) + .id + "  " + (if .loggedIn then .email else "signed out" end))'
+}
+
+cmd_use() {
+    local id="${1:?usage: claude-accounts use <id|default>}" dir=""
+    if [ "$id" != default ]; then
+        dir=$(account_dir "$id")
+        [ -n "$dir" ] || die "no account $id (see claude-accounts ls)"
+        provision "$id"
+    fi
+    printf '%s\n' "$dir" >"$STATE/active-dir.tmp" && mv "$STATE/active-dir.tmp" "$STATE/active-dir"
+    printf '%s\n' "$id" >"$STATE/active.tmp" && mv "$STATE/active.tmp" "$STATE/active"
+    echo "new Claude sessions use: $id"
+}
+
+cmd_add() {
+    local id
+    # od reads exactly 3 bytes; `tr </dev/urandom | head` dies of SIGPIPE, which pipefail turns into an exit.
+    id="acct-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+    write_reg --arg id "$id" --arg dir "$STATE/$id" --arg at "$(date -u +%FT%TZ)" \
+        '.accounts += [{id: $id, dir: $dir, addedAt: $at}]'
+    provision "$id"
+    echo "$id"
+}
+
+cmd_remove() {
+    local id="${1:?usage: claude-accounts remove <id>}" dir
+    dir=$(account_dir "$id")
+    [ -n "$dir" ] || die "no account $id"
+    [ "$(active_id)" = "$id" ] && cmd_use default >/dev/null
+    CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN" auth logout >/dev/null 2>&1 || true
+    write_reg --arg id "$id" '.accounts |= map(select(.id != $id))'
+    if [ -d "$dir" ]; then
+        mkdir -p "$STATE/backups"
+        mv "$dir" "$STATE/backups/removed-$id-$(date +%Y%m%d-%H%M%S)"
+    fi
+    echo "removed $id"
+}
+
+case "${1:-ls}" in
+    ls) shift || true; cmd_ls "$@" ;;
+    use) cmd_use "${2:-}" ;;
+    dir) cat "$STATE/active-dir" 2>/dev/null || true ;;
+    add) cmd_add ;;
+    login)
+        dir=$(account_dir "${2:?usage: claude-accounts login <id>}")
+        [ -n "$dir" ] || die "no account $2"
+        CLAUDE_CONFIG_DIR="$dir" exec "$CLAUDE_BIN" auth login
+        ;;
+    provision) provision "${2:?usage: claude-accounts provision <id>}" ;;
+    remove) cmd_remove "${2:-}" ;;
+    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

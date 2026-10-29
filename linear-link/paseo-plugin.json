@@ -1,0 +1,8 @@
+{
+  "id": "linear-link",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.13.2"
+  },
+  "name": "Linear link"
+}
