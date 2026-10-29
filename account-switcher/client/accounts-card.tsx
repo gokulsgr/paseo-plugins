@@ -5,7 +5,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
-  addAccount,
   cancelLogin,
   getLoginState,
   listAccounts,
@@ -14,10 +13,11 @@ import {
   startLogin,
   useAccount,
   type Account,
+  type Provider,
 } from "../shared/accounts";
-import { claudeIcon } from "./icons";
+import { providerInfo } from "./providers";
 
-const LIST_KEY = ["claude-accounts", "list"];
+const listKey = (provider: Provider) => ["account-switcher", provider, "list"];
 
 export function formatAdded(iso: string): string {
   const date = new Date(iso);
@@ -105,16 +105,28 @@ function Chip({ styles, label }: { styles: Styles; label: string }) {
   );
 }
 
-function SignIn({ id, styles, theme, onDone }: { id: string; styles: Styles; theme: PluginTheme; onDone: () => void }) {
+function SignIn({
+  provider,
+  id,
+  styles,
+  theme,
+  onDone,
+}: {
+  provider: Provider;
+  id: string;
+  styles: Styles;
+  theme: PluginTheme;
+  onDone: () => void;
+}) {
   const toast = useToast();
   const readState = useRpc(getLoginState);
   const submitCode = useRpc(sendLoginCode);
   const cancel = useRpc(cancelLogin);
   const [code, setCode] = useState("");
   const state = useQuery({
-    queryKey: ["claude-accounts", "login", id],
+    queryKey: ["account-switcher", provider, "login", id],
     queryFn: async () => {
-      const next = await readState({ id });
+      const next = await readState({ provider, id });
       if (next.status === "done") {
         toast.show("Signed in");
         onDone();
@@ -125,12 +137,13 @@ function SignIn({ id, styles, theme, onDone }: { id: string; styles: Styles; the
   });
   const send = useMutation({ mutationFn: submitCode, onError: (error) => toast.error(String(error)) });
   const current = state.data;
+  const info = providerInfo[provider];
   return (
     <View style={styles.login}>
       <Text style={styles.muted}>
         {current?.status === "failed"
           ? `Sign-in failed: ${current.message ?? "unknown error"}`
-          : "Finish signing in in your browser. If it did not open, use the link, then paste the code it shows."}
+          : info.signIn}
       </Text>
       {current?.url ? (
         <ExternalLink href={current.url} accessibilityLabel="Open the Claude sign-in page">
@@ -138,10 +151,12 @@ function SignIn({ id, styles, theme, onDone }: { id: string; styles: Styles; the
         </ExternalLink>
       ) : null}
       <View style={styles.actions}>
+        {info.codePlaceholder ? (
+          <>
         <TextInput
           value={code}
           onChangeText={setCode}
-          placeholder="Paste the code here"
+          placeholder={info.codePlaceholder}
           placeholderTextColor={theme.colors.foregroundMuted}
           autoCapitalize="none"
           autoCorrect={false}
@@ -151,15 +166,17 @@ function SignIn({ id, styles, theme, onDone }: { id: string; styles: Styles; the
           accessibilityRole="button"
           accessibilityLabel="Send the sign-in code"
           disabled={!code.trim() || send.isPending}
-          onPress={() => send.mutate({ id, code: code.trim() }, { onSuccess: () => setCode("") })}
+          onPress={() => send.mutate({ provider, id, code: code.trim() }, { onSuccess: () => setCode("") })}
           style={styles.button}
         >
           <Text style={styles.buttonText}>Submit</Text>
         </Pressable>
+          </>
+        ) : null}
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Cancel signing in"
-          onPress={() => void cancel({ id }).then(onDone)}
+          onPress={() => void cancel({ provider, id }).then(onDone)}
           style={styles.plainButton}
         >
           <Text style={styles.muted}>Cancel</Text>
@@ -169,24 +186,32 @@ function SignIn({ id, styles, theme, onDone }: { id: string; styles: Styles; the
   );
 }
 
-export function AccountsCard({ theme, compact }: { theme: PluginTheme; compact: boolean }) {
+export function AccountsCard({ provider, theme, compact }: { provider: Provider; theme: PluginTheme; compact: boolean }) {
+  const info = providerInfo[provider];
   const styles = useMemo(() => makeStyles(theme, compact), [theme, compact]);
   const toast = useToast();
   const queryClient = useQueryClient();
-  const refresh = () => void queryClient.invalidateQueries({ queryKey: LIST_KEY });
+  const refresh = () => void queryClient.invalidateQueries({ queryKey: listKey(provider) });
   const fail = (error: unknown) => toast.error(error instanceof Error ? error.message : String(error));
 
-  const list = useQuery({ queryKey: LIST_KEY, queryFn: useRpc(listAccounts).bind(null, {}) });
+  const readList = useRpc(listAccounts);
+  const list = useQuery({ queryKey: listKey(provider), queryFn: () => readList({ provider }) });
   const use = useMutation({ mutationFn: useRpc(useAccount), onSuccess: refresh, onError: fail });
-  const add = useMutation({ mutationFn: useRpc(addAccount), onError: fail });
   const remove = useMutation({ mutationFn: useRpc(removeAccount), onSuccess: refresh, onError: fail });
   const login = useMutation({ mutationFn: useRpc(startLogin), onError: fail });
   const [signingIn, setSigningIn] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
 
-  const beginLogin = (id: string) => {
-    setSigningIn(id);
-    login.mutate({ id });
+  const beginLogin = (id?: string) => {
+    login.mutate(
+      { provider, id },
+      {
+        onSuccess: (state) => {
+          setSigningIn(state.id);
+          refresh();
+        },
+      },
+    );
   };
   const finishLogin = () => {
     setSigningIn(null);
@@ -205,7 +230,7 @@ export function AccountsCard({ theme, compact }: { theme: PluginTheme; compact: 
             accessibilityRole="button"
             accessibilityLabel={`Use ${account.email ?? account.id} for new Claude sessions`}
             disabled={!account.loggedIn || active}
-            onPress={() => use.mutate({ id: account.id })}
+            onPress={() => use.mutate({ provider, id: account.id })}
             style={{ flex: 1, gap: 4 }}
           >
             <View style={styles.rowName}>
@@ -233,7 +258,7 @@ export function AccountsCard({ theme, compact }: { theme: PluginTheme; compact: 
               onPress={() => {
                 if (confirmRemove !== account.id) return setConfirmRemove(account.id);
                 setConfirmRemove(null);
-                remove.mutate({ id: account.id });
+                remove.mutate({ provider, id: account.id });
               }}
               style={styles.plainButton}
             >
@@ -245,7 +270,7 @@ export function AccountsCard({ theme, compact }: { theme: PluginTheme; compact: 
           </View>
         </View>
         {signingIn === account.id ? (
-          <SignIn id={account.id} styles={styles} theme={theme} onDone={finishLogin} />
+          <SignIn provider={provider} id={account.id} styles={styles} theme={theme} onDone={finishLogin} />
         ) : null}
       </View>
     );
@@ -256,13 +281,10 @@ export function AccountsCard({ theme, compact }: { theme: PluginTheme; compact: 
     <View style={styles.card}>
       <View style={{ gap: 8 }}>
         <View style={styles.titleRow}>
-          <Icon icon={{ svg: claudeIcon }} size={24} />
-          <Text style={styles.title}>Claude</Text>
+          <Icon icon={{ svg: info.icon }} size={24} color={theme.colors.foreground} />
+          <Text style={styles.title}>{info.title}</Text>
         </View>
-        <Text style={styles.muted}>
-          Optional. Paseo can use your normal Claude login; add accounts only if you want quick switching without
-          moving chat sessions.
-        </Text>
+        <Text style={styles.muted}>{info.intro}</Text>
       </View>
 
       <View style={styles.sectionRow}>
@@ -274,16 +296,9 @@ export function AccountsCard({ theme, compact }: { theme: PluginTheme; compact: 
         </View>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Add a Claude account"
-          disabled={add.isPending}
-          onPress={() =>
-            add.mutate({}, {
-              onSuccess: ({ id }) => {
-                refresh();
-                beginLogin(id);
-              },
-            })
-          }
+          accessibilityLabel={`Add a ${info.title} account`}
+          disabled={login.isPending}
+          onPress={() => beginLogin()}
           style={styles.button}
         >
           <Icon name="Plus" size={16} color={theme.colors.foreground} />
@@ -294,26 +309,38 @@ export function AccountsCard({ theme, compact }: { theme: PluginTheme; compact: 
       {list.isError ? <Text style={styles.danger}>Could not read accounts: {String(list.error)}</Text> : null}
 
       <View style={{ gap: 12 }}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Use the System default Claude login for new sessions"
-          disabled={defaultActive}
-          onPress={() => use.mutate({ id: "default" })}
-          style={[styles.row, defaultActive && styles.rowActive]}
-        >
-          <View style={styles.rowName}>
-            <Text style={styles.rowTitle}>
-              System default: {data ? (data.systemDefault.email ?? "signed out") : "…"}
+        {provider === "cursor" ? null : (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Use the System default ${info.title} login for new sessions`}
+            disabled={defaultActive}
+            onPress={() => use.mutate({ provider, id: "default" })}
+            style={[styles.row, defaultActive && styles.rowActive]}
+          >
+            <View style={styles.rowName}>
+              <Text style={styles.rowTitle}>
+                System default: {data ? (data.systemDefault?.email ?? "signed out") : "…"}
+              </Text>
+              {defaultActive ? <Chip styles={styles} label="Active" /> : null}
+            </View>
+            <Text style={styles.muted}>
+              Use your current {host} {info.title} login.
             </Text>
-            {defaultActive ? <Chip styles={styles} label="Active" /> : null}
-          </View>
-          <Text style={styles.muted}>Use your current {host} Claude login.</Text>
-        </Pressable>
+          </Pressable>
+        )}
         {data?.accounts.map(accountRow)}
+        {signingIn === "new" ? (
+          <View style={styles.row}>
+            <Text style={styles.rowTitle}>New {info.title} account</Text>
+            <SignIn provider={provider} id="new" styles={styles} theme={theme} onDone={finishLogin} />
+          </View>
+        ) : null}
       </View>
 
       <Text style={styles.muted}>
-        Click an account to use it. New Claude sessions and terminals use it; sessions already running keep theirs.
+        {provider === "cursor"
+          ? "Click an account to make it the live Cursor login."
+          : `Click an account to use it. New ${info.title} sessions and terminals use it; sessions already running keep theirs.`}
       </Text>
     </View>
   );

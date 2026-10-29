@@ -1,0 +1,12 @@
+#!/bin/bash
+# `codex` for the account picked with codex-accounts. An explicit CODEX_HOME wins, and Orca's
+# terminals keep Orca's own account routing.
+if [ -z "${CODEX_HOME:-}" ] && [ -z "${ORCA_TERMINAL_HANDLE:-}" ]; then
+    dir=$(cat "$HOME/.codex-accounts/active-dir" 2>/dev/null || true)
+    [ -n "$dir" ] && export CODEX_HOME="$dir"
+fi
+# Paseo's terminal draws 24-bit color but does not say so, and its profiles skip ~/.zshrc.
+[ -n "${PASEO_TERMINAL_ID:-}" ] && export COLORTERM="${COLORTERM:-truecolor}"
+bin="$HOME/.local/bin/codex"
+[ -x "$bin" ] || bin=$(command -v codex)
+exec "$bin" "$@"

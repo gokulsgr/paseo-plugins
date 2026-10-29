@@ -1,0 +1,159 @@
+#!/bin/bash
+# Cursor account switcher. cursor-agent keeps one login for the whole Mac, in the Keychain under
+# fixed names, whatever CURSOR_CONFIG_DIR says, so switching swaps that login with a saved one.
+# Every running cursor-agent sees the swap, unlike Claude and Codex where running sessions keep
+# theirs. The Cursor app's own login is separate and untouched. Orca has no Cursor switcher.
+#
+#   cursor-accounts                  list accounts (same as ls)
+#   cursor-accounts ls [--json]      saved logins and which one is live; saves the live one first
+#   cursor-accounts use <id>         make a saved login the live one
+#   cursor-accounts begin-add        save the live login, then sign it out so `cursor-agent login` can add another
+#   cursor-accounts finish-add       save the login that `cursor-agent login` just made
+#   cursor-accounts cancel-add       put back the login that was live before begin-add
+#   cursor-accounts remove <id>      forget a saved login (not the live one)
+set -euo pipefail
+
+STATE="$HOME/.cursor-accounts"
+REG="$STATE/accounts.json"
+CLI_CONFIG="${CURSOR_CONFIG_DIR:-$HOME/.cursor}/cli-config.json"
+AGENT_BIN=$(command -v cursor-agent || echo "$HOME/.local/bin/cursor-agent")
+KEY_ACCOUNT="cursor-user"
+LIVE_ACCESS="cursor-access-token"
+LIVE_REFRESH="cursor-refresh-token"
+
+mkdir -p "$STATE"
+[ -f "$REG" ] || printf '{"accounts":[]}\n' >"$REG"
+
+die() { echo "cursor-accounts: $*" >&2; exit 1; }
+
+write_reg() {
+    local tmp="$REG.tmp.$$"
+    jq "$@" "$REG" >"$tmp" && mv "$tmp" "$REG"
+}
+
+slot() { printf 'account-switcher.cursor.%s.%s' "$1" "$2"; }
+
+key_read() { security find-generic-password -a "$KEY_ACCOUNT" -s "$1" -w 2>/dev/null || true; }
+
+# Through `security -i` so a token never shows up in another process's argument list.
+key_write() {
+    printf 'add-generic-password -U -a "%s" -s "%s" -w "%s"\n' "$KEY_ACCOUNT" "$1" "$2" | security -i >/dev/null
+}
+
+key_delete() { security delete-generic-password -a "$KEY_ACCOUNT" -s "$1" >/dev/null 2>&1 || true; }
+
+live_info() {
+    "$AGENT_BIN" status --format json 2>/dev/null | jq -c 'select(.isAuthenticated == true) | .userInfo' 2>/dev/null || true
+}
+
+# Save the live login into the slot of the account with the same email, or a new one; prints its id.
+capture() {
+    local info email access refresh id auth
+    access=$(key_read "$LIVE_ACCESS")
+    refresh=$(key_read "$LIVE_REFRESH")
+    [ -n "$access" ] || return 0
+    info=$(live_info)
+    email=$(printf '%s' "$info" | jq -r '.email // empty' 2>/dev/null || true)
+    [ -n "$email" ] || return 0
+    id=$(jq -r --arg e "$email" '.accounts[] | select(.email == $e) | .id' "$REG" | head -1)
+    if [ -z "$id" ]; then
+        # od reads exactly 3 bytes; `tr </dev/urandom | head` dies of SIGPIPE, which pipefail turns into an exit.
+        id="acct-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+        write_reg --arg id "$id" --arg at "$(date -u +%FT%TZ)" '.accounts += [{id: $id, addedAt: $at}]'
+    fi
+    key_write "$(slot "$id" access)" "$access"
+    [ -n "$refresh" ] && key_write "$(slot "$id" refresh)" "$refresh"
+    auth=$(jq -c '.authInfo // null' "$CLI_CONFIG" 2>/dev/null || echo null)
+    write_reg --arg id "$id" --argjson info "$info" --argjson auth "$auth" '
+        .accounts |= map(if .id == $id then . + {email: $info.email, teamName: $info.teamName,
+            displayName: ([$info.firstName, $info.lastName] | map(select(.)) | join(" ")), authInfo: $auth} else . end)'
+    printf '%s\n' "$id" >"$STATE/active"
+    echo "$id"
+}
+
+set_auth_info() {
+    local tmp="$CLI_CONFIG.tmp.$$"
+    [ -f "$CLI_CONFIG" ] || return 0
+    jq --argjson auth "$1" 'if $auth == null then del(.authInfo) else .authInfo = $auth end' "$CLI_CONFIG" >"$tmp" \
+        && mv "$tmp" "$CLI_CONFIG"
+}
+
+cmd_ls() {
+    local json
+    capture >/dev/null
+    json=$(jq --arg active "$(cat "$STATE/active" 2>/dev/null || echo none)" '{
+        active: $active,
+        systemDefault: null,
+        accounts: [.accounts[] | {id, dir: "", addedAt, loggedIn: true, email, orgName: .teamName, subscriptionType: null}]
+    }' "$REG")
+    if [ "${1:-}" = "--json" ]; then
+        printf '%s\n' "$json"
+        return
+    fi
+    printf '%s\n' "$json" | jq -r '.active as $a | .accounts[] | (if .id == $a then "* " else "  " end) + .id + "  " + (.email // "?") + "  " + (.orgName // "")'
+}
+
+cmd_use() {
+    local id="${1:?usage: cursor-accounts use <id>}" access refresh auth
+    jq -e --arg id "$id" 'any(.accounts[]; .id == $id)' "$REG" >/dev/null || die "no account $id (see cursor-accounts ls)"
+    access=$(key_read "$(slot "$id" access)")
+    [ -n "$access" ] || die "no saved login for $id; sign it in again"
+    refresh=$(key_read "$(slot "$id" refresh)")
+    # The live login may have refreshed its tokens since it was saved.
+    capture >/dev/null
+    key_write "$LIVE_ACCESS" "$access"
+    if [ -n "$refresh" ]; then key_write "$LIVE_REFRESH" "$refresh"; else key_delete "$LIVE_REFRESH"; fi
+    auth=$(jq -c --arg id "$id" '.accounts[] | select(.id == $id) | .authInfo // null' "$REG")
+    set_auth_info "$auth"
+    printf '%s\n' "$id" >"$STATE/active"
+    echo "Cursor now uses: $(jq -r --arg id "$id" '.accounts[] | select(.id == $id) | .email' "$REG")"
+}
+
+cmd_begin_add() {
+    local previous
+    previous=$(capture)
+    printf '%s\n' "${previous:-}" >"$STATE/pending-restore"
+    key_delete "$LIVE_ACCESS"
+    key_delete "$LIVE_REFRESH"
+    set_auth_info null
+    printf 'none\n' >"$STATE/active"
+}
+
+cmd_finish_add() {
+    local id
+    id=$(capture)
+    [ -n "$id" ] || die "cursor-agent is not signed in yet"
+    rm -f "$STATE/pending-restore"
+    echo "$id"
+}
+
+cmd_cancel_add() {
+    local previous
+    previous=$(cat "$STATE/pending-restore" 2>/dev/null || true)
+    rm -f "$STATE/pending-restore"
+    if [ -n "$(key_read "$LIVE_ACCESS")" ]; then
+        capture >/dev/null
+    elif [ -n "$previous" ]; then
+        cmd_use "$previous"
+    fi
+}
+
+cmd_remove() {
+    local id="${1:?usage: cursor-accounts remove <id>}"
+    jq -e --arg id "$id" 'any(.accounts[]; .id == $id)' "$REG" >/dev/null || die "no account $id"
+    [ "$(cat "$STATE/active" 2>/dev/null)" = "$id" ] && die "$id is the live Cursor login; switch to another account first"
+    key_delete "$(slot "$id" access)"
+    key_delete "$(slot "$id" refresh)"
+    write_reg --arg id "$id" '.accounts |= map(select(.id != $id))'
+    echo "removed $id"
+}
+
+case "${1:-ls}" in
+    ls) shift || true; cmd_ls "$@" ;;
+    use) cmd_use "${2:-}" ;;
+    begin-add) cmd_begin_add ;;
+    finish-add) cmd_finish_add ;;
+    cancel-add) cmd_cancel_add ;;
+    remove) cmd_remove "${2:-}" ;;
+    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

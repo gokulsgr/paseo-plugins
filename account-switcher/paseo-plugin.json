@@ -1,8 +1,8 @@
 {
-  "id": "claude-accounts",
+  "id": "account-switcher",
   "media": [],
   "requirements": {
     "paseo": ">=0.13.2"
   },
-  "name": "Claude accounts"
+  "name": "Account switcher"
 }

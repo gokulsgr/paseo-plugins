@@ -4,36 +4,43 @@ Two [Paseo](https://paseo.sh) plugins, built against Paseo 0.13.2 on macOS.
 
 | Plugin | What it does |
 | --- | --- |
-| [`claude-accounts`](claude-accounts) | Switch the Claude account new sessions use in one click, the way Orca's account switcher works. Accounts screen, sidebar switcher, Settings entry, ⌘K item. |
+| [`account-switcher`](account-switcher) | Switch between several Claude, Codex and Cursor accounts in one click, the way Orca's account switcher works. Accounts screen, a sidebar row per tool, a Settings entry and a ⌘K item. |
 | [`linear-link`](linear-link) | A header button on every workspace tied to a Linear issue. It opens the issue in that workspace's Paseo browser tab. |
 
-## claude-accounts
+## account-switcher
 
-Each extra account gets its own Claude config folder. Chats, skills, hooks, plugins and settings
-are links into `~/.claude`, so switching moves no session; only the login and the account's own
-state stay separate. `~/.claude` is the "System default" account.
+| Tool | How an account is kept | What switching changes |
+| --- | --- | --- |
+| Claude | Its own `CLAUDE_CONFIG_DIR`; chats, skills, hooks, plugins and settings link to `~/.claude` | New sessions; running ones keep their login |
+| Codex | Its own `CODEX_HOME`; skills, hooks, plugins, rules and `AGENTS.md` link to `~/.codex`, sessions and the thread database are shared through `sqlite_home`, `config.toml` is copied | New sessions; running ones keep their login |
+| Cursor | A saved copy of the login in the Keychain; `cursor-agent` has one login per machine whatever its config folder | The live login, for every running `cursor-agent` at once. The Cursor app is not touched |
 
-The plugin drives the `claude-accounts` command in [`claude-accounts/bin`](claude-accounts/bin),
-which needs `jq` and `rsync`. Put it where the plugin looks first, or anywhere on `PATH`:
+`~/.claude` and `~/.codex` stay the "System default" accounts. Orca has no Cursor switcher; this
+one swaps the `cursor-access-token` and `cursor-refresh-token` Keychain entries and saves the live
+login first, so nothing is lost.
+
+The plugin drives the scripts in [`account-switcher/bin`](account-switcher/bin) (`jq`, `rsync`
+and `python3` required). Link them where the plugin looks first:
 
 ```bash
-mkdir -p ~/.local/share/claude-accounts
-ln -s "$PWD/claude-accounts/bin" ~/.local/share/claude-accounts/bin
-ln -s ~/.local/share/claude-accounts/bin/claude-accounts ~/.local/bin/claude-accounts
+mkdir -p ~/.local/share/account-switcher
+ln -s "$PWD/account-switcher/bin" ~/.local/share/account-switcher/bin
+for t in claude codex cursor; do ln -s ~/.local/share/account-switcher/bin/$t-accounts ~/.local/bin/; done
 ```
 
-New sessions follow the picked account through `claude-routed`:
+New sessions follow the picked account:
 
-- Chat agents: the plugin sets `CLAUDE_CONFIG_DIR` when a Claude session opens.
-- Terminals: point the Paseo "Claude Code" terminal profile's command at
-  `~/.local/share/claude-accounts/bin/claude-routed`, and add this to `~/.zshrc` for `claude` typed
-  in any shell:
+- Chat agents: the plugin sets `CLAUDE_CONFIG_DIR` or `CODEX_HOME` when a session opens.
+- Terminals: point the Paseo "Claude Code" and "Codex" terminal profiles at
+  `~/.local/share/account-switcher/bin/claude-routed` and `codex-routed`, and add this to `~/.zshrc`:
 
   ```zsh
-  claude() { "$HOME/.local/share/claude-accounts/bin/claude-routed" "$@"; }
+  claude() { "$HOME/.local/share/account-switcher/bin/claude-routed" "$@"; }
+  codex() { "$HOME/.local/share/account-switcher/bin/codex-routed" "$@"; }
   ```
 
-Sessions already running keep the login they started with.
+The same scripts work without Paseo: `claude-accounts use personal`, `codex-accounts ls`,
+`cursor-accounts use <id>`.
 
 ## linear-link
 
@@ -44,7 +51,7 @@ workspace slug and issue prefix are constants in [`linear-link/client/issue.ts`]
 ## Install
 
 ```bash
-paseo plugin install github:gokulsgr/paseo-plugins:claude-accounts
+paseo plugin install github:gokulsgr/paseo-plugins:account-switcher
 paseo plugin install github:gokulsgr/paseo-plugins:linear-link
 ```
 

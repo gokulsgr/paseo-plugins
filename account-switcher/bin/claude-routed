@@ -5,6 +5,8 @@ if [ -z "${CLAUDE_CONFIG_DIR:-}" ] && [ -z "${ORCA_TERMINAL_HANDLE:-}" ]; then
     dir=$(cat "$HOME/.claude-accounts/active-dir" 2>/dev/null || true)
     [ -n "$dir" ] && export CLAUDE_CONFIG_DIR="$dir"
 fi
+# Paseo's terminal draws 24-bit color but does not say so, and its profiles skip ~/.zshrc.
+[ -n "${PASEO_TERMINAL_ID:-}" ] && export COLORTERM="${COLORTERM:-truecolor}"
 bin="$HOME/.local/bin/claude"
 [ -x "$bin" ] || bin=$(PATH="${PATH//$HOME\/.local\/share\/claude-accounts\/bin:/}" command -v claude)
 exec "$bin" "$@"

@@ -1,0 +1,178 @@
+#!/bin/bash
+# Codex account switcher, built the way Orca's is: one CODEX_HOME per account. Skills, hooks,
+# plugins, rules and AGENTS.md are links into ~/.codex, sessions and the thread database are shared
+# through `sqlite_home`, and config.toml is copied in. Only auth.json stays per account.
+# ~/.codex itself is the "System default" account.
+#
+#   codex-accounts                    list accounts (same as ls)
+#   codex-accounts ls [--json]        accounts, their logins, and which one is active
+#   codex-accounts use <id|default>   new Codex sessions use that account
+#   codex-accounts dir                CODEX_HOME of the active account (empty for default)
+#   codex-accounts add                new account folder, signed out; prints its id
+#   codex-accounts login <id>         sign that account in (interactive)
+#   codex-accounts provision <id>     redo the links and the config copy
+#   codex-accounts remove <id>        forget it and move its folder to backups
+set -euo pipefail
+
+STATE="$HOME/.codex-accounts"
+MAIN="$HOME/.codex"
+REG="$STATE/accounts.json"
+CODEX_BIN="$HOME/.local/bin/codex"
+[ -x "$CODEX_BIN" ] || CODEX_BIN=$(command -v codex)
+
+SHARED=(AGENTS.md hooks.json hooks skills plugins plugin-state profile-v2 themes prompts rules .tmp/bundled-marketplaces)
+HISTORY=(sessions archived_sessions history.jsonl session_index.jsonl)
+
+mkdir -p "$STATE"
+[ -f "$REG" ] || printf '{"accounts":[]}\n' >"$REG"
+
+die() { echo "codex-accounts: $*" >&2; exit 1; }
+
+account_dir() { jq -r --arg id "$1" '.accounts[] | select(.id == $id) | .dir' "$REG"; }
+
+active_id() { cat "$STATE/active" 2>/dev/null || echo default; }
+
+write_reg() {
+    local tmp="$REG.tmp.$$"
+    jq "$@" "$REG" >"$tmp" && mv "$tmp" "$REG"
+}
+
+# Point dir/name at ~/.codex/name. A real file or folder there is kept in backups, never deleted.
+link_into() {
+    local dir="$1" name="$2" backup="$3" target="$MAIN/$2" here="$1/$2"
+    [ -L "$here" ] && [ "$(readlink "$here")" = "$target" ] && return 0
+    if [ -L "$here" ]; then
+        rm "$here"
+    elif [ -e "$here" ]; then
+        if [ -d "$here" ] && [ -d "$target" ]; then
+            rsync -a --ignore-existing "$here/" "$target/"
+        fi
+        mkdir -p "$backup/$(dirname "$name")"
+        mv "$here" "$backup/$name"
+    fi
+    mkdir -p "$(dirname "$here")"
+    ln -s "$target" "$here"
+}
+
+# The account reads its own config.toml, so copy the shared one and point the thread database at
+# ~/.codex so every account sees one history.
+copy_config() {
+    local dir="$1" tmp="$1/config.toml.tmp.$$"
+    [ -f "$MAIN/config.toml" ] || return 0
+    if grep -qE '^model_provider *= *"[^"]*"' "$MAIN/config.toml" \
+        && ! grep -qE '^model_provider *= *"openai"' "$MAIN/config.toml"; then
+        die "~/.codex/config.toml pins a custom model_provider, which would ignore an account's ChatGPT login"
+    fi
+    {
+        grep -q '^sqlite_home *=' "$MAIN/config.toml" || printf 'sqlite_home = "%s"\n' "$MAIN"
+        cat "$MAIN/config.toml"
+    } >"$tmp" && mv "$tmp" "$dir/config.toml"
+}
+
+provision() {
+    local id="$1" dir name backup
+    dir=$(account_dir "$id")
+    [ -n "$dir" ] || die "no account $id"
+    mkdir -p "$dir"
+    backup="$STATE/backups/$id-$(date +%Y%m%d-%H%M%S)"
+    for name in "${HISTORY[@]}"; do
+        if [ ! -e "$MAIN/$name" ]; then
+            case "$name" in *.jsonl) touch "$MAIN/$name" ;; *) mkdir -p "$MAIN/$name" ;; esac
+        fi
+        link_into "$dir" "$name" "$backup"
+    done
+    for name in "${SHARED[@]}"; do
+        [ -e "$MAIN/$name" ] && link_into "$dir" "$name" "$backup"
+    done
+    copy_config "$dir"
+    [ -d "$backup" ] && echo "kept the old copies in $backup" >&2
+    return 0
+}
+
+# Codex has no JSON status, so the email and plan come from the id token in auth.json.
+status_json() {
+    local home="$1" logged=false
+    if CODEX_HOME="$home" "$CODEX_BIN" login status >/dev/null 2>&1; then logged=true; fi
+    python3 -I - "$home/auth.json" "$logged" <<'PY'
+import base64, json, sys
+path, logged = sys.argv[1], sys.argv[2] == "true"
+out = {"loggedIn": logged, "email": None, "orgName": None, "subscriptionType": None}
+try:
+    token = json.load(open(path))["tokens"]["id_token"].split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+    auth = claims.get("https://api.openai.com/auth", {})
+    out.update(email=claims.get("email"), subscriptionType=auth.get("chatgpt_plan_type"))
+except Exception:
+    pass
+print(json.dumps(out))
+PY
+}
+
+cmd_ls() {
+    local active rows="" id dir added json
+    active=$(active_id)
+    while IFS=$'\t' read -r id dir added; do
+        [ -n "$id" ] || continue
+        rows+=$(status_json "$dir" | jq -c --arg id "$id" --arg dir "$dir" --arg added "$added" \
+            '{id: $id, dir: $dir, addedAt: $added} + .')$'\n'
+    done < <(jq -r '.accounts[] | "\(.id)\t\(.dir)\t\(.addedAt // "")"' "$REG")
+    json=$(jq -n --arg active "$active" --argjson def "$(status_json "$MAIN")" --argjson accounts "$(printf '%s' "$rows" | jq -s .)" \
+        '{active: $active, systemDefault: $def, accounts: $accounts}')
+    if [ "${1:-}" = "--json" ]; then
+        printf '%s\n' "$json"
+        return
+    fi
+    printf '%s\n' "$json" | jq -r '
+        (if .active == "default" then "* " else "  " end) + "default   " + (.systemDefault.email // "signed out") + "  (System default)",
+        (.active as $a | .accounts[] | (if .id == $a then "* " else "  " end) + .id + "  " + (if .loggedIn then (.email // "signed in") else "signed out" end))'
+}
+
+cmd_use() {
+    local id="${1:?usage: codex-accounts use <id|default>}" dir=""
+    if [ "$id" != default ]; then
+        dir=$(account_dir "$id")
+        [ -n "$dir" ] || die "no account $id (see codex-accounts ls)"
+        provision "$id"
+    fi
+    printf '%s\n' "$dir" >"$STATE/active-dir.tmp" && mv "$STATE/active-dir.tmp" "$STATE/active-dir"
+    printf '%s\n' "$id" >"$STATE/active.tmp" && mv "$STATE/active.tmp" "$STATE/active"
+    echo "new Codex sessions use: $id"
+}
+
+cmd_add() {
+    local id
+    # od reads exactly 3 bytes; `tr </dev/urandom | head` dies of SIGPIPE, which pipefail turns into an exit.
+    id="acct-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
+    write_reg --arg id "$id" --arg dir "$STATE/$id" --arg at "$(date -u +%FT%TZ)" \
+        '.accounts += [{id: $id, dir: $dir, addedAt: $at}]'
+    provision "$id"
+    echo "$id"
+}
+
+cmd_remove() {
+    local id="${1:?usage: codex-accounts remove <id>}" dir
+    dir=$(account_dir "$id")
+    [ -n "$dir" ] || die "no account $id"
+    [ "$(active_id)" = "$id" ] && cmd_use default >/dev/null
+    write_reg --arg id "$id" '.accounts |= map(select(.id != $id))'
+    if [ -d "$dir" ]; then
+        mkdir -p "$STATE/backups"
+        mv "$dir" "$STATE/backups/removed-$id-$(date +%Y%m%d-%H%M%S)"
+    fi
+    echo "removed $id"
+}
+
+case "${1:-ls}" in
+    ls) shift || true; cmd_ls "$@" ;;
+    use) cmd_use "${2:-}" ;;
+    dir) cat "$STATE/active-dir" 2>/dev/null || true ;;
+    add) cmd_add ;;
+    login)
+        dir=$(account_dir "${2:?usage: codex-accounts login <id>}")
+        [ -n "$dir" ] || die "no account $2"
+        CODEX_HOME="$dir" exec "$CODEX_BIN" login
+        ;;
+    provision) provision "${2:?usage: codex-accounts provision <id>}" ;;
+    remove) cmd_remove "${2:-}" ;;
+    *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
