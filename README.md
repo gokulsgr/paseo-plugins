@@ -4,7 +4,7 @@ Two [Paseo](https://paseo.sh) plugins, built against Paseo 0.13.2 on macOS.
 
 | Plugin | What it does |
 | --- | --- |
-| [`account-switcher`](account-switcher) | Switch between several Claude, Codex and Cursor accounts in one click, the way Orca's account switcher works. Accounts screen, a sidebar row per tool, a Settings entry and a ⌘K item. |
+| [`account-switcher`](account-switcher) | Switch between several Claude, Codex and Cursor accounts in one click, the way Orca's account switcher works. One "Accounts" button in the sidebar, an accounts screen, a Settings entry and a ⌘K item. |
 | [`linear-link`](linear-link) | A header button on every workspace tied to a Linear issue. It opens the issue in that workspace's Paseo browser tab. |
 
 ## account-switcher
