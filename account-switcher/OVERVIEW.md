@@ -1,6 +1,6 @@
 Switch between several Claude, Codex and Cursor accounts in one click, the way Orca's account switcher works.
 
-One "Accounts" button in the sidebar footer lists every account of each tool; click one to switch to it. The Accounts screen (also under Settings and in the Command Center) adds an account, signs one in again, or removes one.
+The Accounts page, under Settings → Plugins and in the Command Center, lists every account of each tool: click one to switch to it, or add, sign in again, or remove one.
 
 Claude and Codex accounts each get their own config folder that links back to `~/.claude` or `~/.codex` for chats, skills, hooks, plugins and settings, so switching never moves a session. New agents and the Claude Code and Codex terminal profiles follow the choice; sessions already running keep their login.
 

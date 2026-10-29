@@ -4,7 +4,6 @@ import { View } from "react-native";
 import { providers } from "./shared/accounts";
 import { AccountsCard } from "./client/accounts-card";
 import { accountsIcon } from "./client/providers";
-import { SwitcherItem } from "./client/switcher";
 
 function AllCards({ theme, compact }: { theme: PluginScreenProps["theme"]; compact: boolean }) {
   return (
@@ -33,7 +32,6 @@ function AccountsSettings({ theme, layout }: PluginSurfaceProps) {
 export default function contribute(client: PluginClientContext) {
   client.addScreen({ id: "accounts", title: "Accounts", Component: AccountsScreen });
   client.addSettingsScreen({ id: "accounts", title: "Accounts", icon: { svg: accountsIcon }, Component: AccountsSettings });
-  client.addSidebarFooterItem({ id: "switcher", title: "Account switcher", Component: SwitcherItem });
   client.addCommandCenterItem({
     id: "manage-accounts",
     title: "Accounts: switch Claude, Codex or Cursor",
